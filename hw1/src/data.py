@@ -8,6 +8,7 @@ from typing import Callable, Optional, Sequence
 
 import numpy as np
 import torch
+import copy
 from PIL import Image
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Dataset
@@ -284,3 +285,56 @@ def build_loaders(
     )
 
     return train_loader, val_loader, test_loader
+
+
+def build_train_transform(
+    level: int, image_size: int = 160
+) -> transforms.Compose:
+    """Train augmentation of increasing strength.
+
+    level 0: horizontal flip only (identical to the baseline)
+    level 1: + moderate random crop and color jitter
+    level 2: + strong crop, color jitter, rotation, random erasing
+    Works on float CHW tensors in [0, 1], before ImageNet normalization.
+    """
+    if level not in (0, 1, 2):
+        raise ValueError(f"Unknown augmentation level: {level}")
+
+    ops: list = [transforms.RandomHorizontalFlip(p=0.5)]
+
+    if level == 1:
+        ops += [
+            transforms.RandomResizedCrop(
+                image_size, scale=(0.6, 1.0), ratio=(0.8, 1.25), antialias=True
+            ),
+            transforms.ColorJitter(
+                brightness=0.2, contrast=0.2, saturation=0.2
+            ),
+        ]
+    elif level == 2:
+        ops += [
+            transforms.RandomResizedCrop(
+                image_size,
+                scale=(0.35, 1.0),
+                ratio=(0.75, 1.33),
+                antialias=True,
+            ),
+            transforms.ColorJitter(
+                brightness=0.4, contrast=0.4, saturation=0.4, hue=0.05
+            ),
+            transforms.RandomRotation(15),
+            transforms.RandomErasing(p=0.25, scale=(0.02, 0.15)),
+        ]
+
+    return transforms.Compose(ops)
+
+
+def clone_with_transform(dataset: CaltechDataset, transform) -> CaltechDataset:
+    """Shallow copy of a dataset with a different transform.
+
+    The memmap and labels are shared, and the original dataset (used by the
+    baseline and other experiments) is not mutated.
+    """
+    clone = copy.copy(dataset)
+    clone.transform = transform
+    return clone

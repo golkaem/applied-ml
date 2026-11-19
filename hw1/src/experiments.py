@@ -5,14 +5,14 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Optional
+from typing import Mapping, Optional, Sequence
 
 import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset
 
-from src.data import build_loaders
+from src.data import build_loaders, build_train_transform, clone_with_transform
 from src.models import build_model, build_optimizer
 from src.training import (
     evaluate_model,
@@ -21,6 +21,14 @@ from src.training import (
 )
 from src.utils import set_seed
 from src.visualization import plot_history
+
+
+@dataclass(frozen=True)
+class AugmentationStage:
+    """One stage of iterative augmentation."""
+
+    level: int  # 0, 1 or 2
+    epochs: int
 
 
 @dataclass(frozen=True)
@@ -69,6 +77,9 @@ def run_baseline_experiment(
     model_name: str,
     settings: ModelSettings,
     config: BaselineConfig,
+    aug_stages: Optional[Sequence[AugmentationStage]] = None,
+    experiment_prefix: Optional[str] = None,
+    title_prefix: str = "Baseline",
 ) -> ExperimentResult:
     """Train and evaluate one full fine-tuning baseline."""
     # Reseed before every experiment
@@ -114,26 +125,69 @@ def run_baseline_experiment(
         weight_decay=config.weight_decay,
     )
 
-    experiment_name = f"{config.baseline_prefix}_{model_name}"
+    prefix = experiment_prefix or config.baseline_prefix
+    experiment_name = f"{prefix}_{model_name}"
     started = time.perf_counter()
 
     # Train
-    history = train_model(
+    train_kwargs = dict(
         model=model,
-        train_loader=train_loader,
         val_loader=val_loader,
         optimizer=optimizer,
         criterion=config.criterion,
         num_classes=config.num_classes,
-        epochs=settings.epochs,
         checkpoint_dir=config.checkpoint_dir,
         experiment_name=experiment_name,
         scheduler=None,
-        history=None,
         early_stopping_patience=settings.early_stopping_patience,
         device=config.device,
         use_channels_last=settings.channels_last,
     )
+
+    if aug_stages is None:
+        # Baseline behaviour
+        history = train_model(
+            train_loader=train_loader,
+            epochs=settings.epochs,
+            history=None,
+            **train_kwargs,
+        )
+    else:
+        history = None
+        planned_epochs = 0
+        for stage_idx, stage in enumerate(aug_stages):
+            print(
+                f"\nAugmentation stage {stage_idx + 1}/{len(aug_stages)}: "
+                f"level={stage.level}, epochs={stage.epochs}"
+            )
+            stage_dataset = clone_with_transform(
+                config.train_dataset,
+                build_train_transform(
+                    stage.level,
+                    image_size=config.train_dataset.images.shape[1],
+                ),
+            )
+            # New train loader per stage; seed shifted so the shuffle order
+            # differs between stages
+            # Val/test loaders are reused
+            stage_train_loader, _, _ = build_loaders(
+                train_dataset=stage_dataset,
+                val_dataset=config.val_dataset,
+                test_dataset=config.test_dataset,
+                batch_size=settings.batch_size,
+                num_workers=config.num_workers,
+                seed=config.seed + stage_idx,
+            )
+            history = train_model(
+                train_loader=stage_train_loader,
+                epochs=stage.epochs,
+                history=history,  # continues epochs / best F1 / patience
+                **train_kwargs,
+            )
+            planned_epochs += stage.epochs
+            if len(history["epoch"]) < planned_epochs:
+                print("Early stopping triggered, remaining stages skipped")
+                break
 
     train_minutes = (time.perf_counter() - started) / 60.0
     best_checkpoint = config.checkpoint_dir / f"{experiment_name}_best.pt"
@@ -171,7 +225,7 @@ def run_baseline_experiment(
     # Plot the history
     plot_history(
         history,
-        title_prefix=f"Baseline: {model_name}",
+        title_prefix=f"{title_prefix}: {model_name}",
     )
 
     # Return results
