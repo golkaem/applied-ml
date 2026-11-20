@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
+import copy
 import re
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
 import numpy as np
 import torch
-import copy
 from PIL import Image
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Dataset
@@ -329,7 +329,10 @@ def build_train_transform(
     return transforms.Compose(ops)
 
 
-def clone_with_transform(dataset: CaltechDataset, transform) -> CaltechDataset:
+def clone_with_transform(
+    dataset: CaltechDataset,
+    transform: Callable[[torch.Tensor], torch.Tensor],
+) -> CaltechDataset:
     """Shallow copy of a dataset with a different transform.
 
     The memmap and labels are shared, and the original dataset (used by the
