@@ -28,7 +28,7 @@ def build_model(model_name: str, num_classes: int) -> tuple[nn.Module, str]:
     else:
         raise ValueError(f"Unknown model: {model_name}")
 
-    # Every layer can de trained
+    # Every layer can be trained
     for parameter in model.parameters():
         parameter.requires_grad = True
 
@@ -80,3 +80,67 @@ def build_optimizer(
         raise ValueError("The model has no trainable parameters")
 
     return optim.AdamW(parameter_groups, weight_decay=weight_decay)
+
+
+# Parts are listed from the head towards the input, in unfreezing order.
+# Prefixes end with "." so that "features.1." does not match "features.10."
+UNFREEZE_GROUPS: dict[str, list[tuple[str, tuple[str, ...]]]] = {
+    "mobilenet_v3_small": [
+        ("head", ("classifier.",)),
+        ("late", tuple(f"features.{i}." for i in range(9, 13))),
+        ("mid", tuple(f"features.{i}." for i in range(4, 9))),
+        ("early", tuple(f"features.{i}." for i in range(0, 4))),
+    ],
+    "shufflenet_v2_x1_0": [
+        ("head", ("fc.",)),
+        ("late", ("stage4.", "conv5.")),
+        ("mid", ("stage3.",)),
+        ("early", ("conv1.", "stage2.")),
+    ],
+}
+
+
+def get_unfreeze_groups(
+    model_name: str,
+) -> list[tuple[str, tuple[str, ...]]]:
+    """Return (part name, parameter name prefixes), head first."""
+    if model_name not in UNFREEZE_GROUPS:
+        raise ValueError(f"No unfreezing plan for model: {model_name}")
+    return UNFREEZE_GROUPS[model_name]
+
+
+def assert_groups_cover_model(model: nn.Module, model_name: str) -> None:
+    """Check that every parameter belongs to exactly one part."""
+    prefixes = [
+        prefix
+        for _, group_prefixes in get_unfreeze_groups(model_name)
+        for prefix in group_prefixes
+    ]
+    for name, _ in model.named_parameters():
+        matches = sum(name.startswith(prefix) for prefix in prefixes)
+        if matches != 1:
+            raise ValueError(
+                f"Parameter {name} matches {matches} unfreezing groups"
+            )
+
+
+def freeze_all_parameters(model: nn.Module) -> None:
+    for parameter in model.parameters():
+        parameter.requires_grad = False
+
+
+def unfreeze_group(
+    model: nn.Module,
+    prefixes: tuple[str, ...],
+) -> list[nn.Parameter]:
+    """Make parameters with the given name prefixes trainable."""
+    parameters = []
+    for name, parameter in model.named_parameters():
+        if name.startswith(prefixes):
+            parameter.requires_grad = True
+            parameters.append(parameter)
+
+    if not parameters:
+        raise ValueError(f"No parameters found for prefixes {prefixes}")
+
+    return parameters
