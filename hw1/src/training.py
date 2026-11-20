@@ -13,6 +13,28 @@ import torch.optim as optim
 from sklearn.metrics import accuracy_score, f1_score
 from torch.utils.data import DataLoader
 
+BATCH_NORM_TYPES = (
+    nn.BatchNorm1d,
+    nn.BatchNorm2d,
+    nn.BatchNorm3d,
+    nn.SyncBatchNorm,
+)
+
+
+def _set_train_mode(model: nn.Module) -> None:
+    """Switch to train mode while keeping frozen BatchNorm layers in eval.
+
+    requires_grad=False stops parameter updates, but BatchNorm running
+    statistics keep changing in train mode. During iterative unfreezing,
+    frozen parts of the backbone must therefore stay in eval mode.
+    """
+    model.train()
+
+    for module in model.modules():
+        if isinstance(module, BATCH_NORM_TYPES):
+            if not any(p.requires_grad for p in module.parameters()):
+                module.eval()
+
 
 def calculate_metrics(
     y_true: Sequence[int],
@@ -56,7 +78,7 @@ def run_epoch(
     is_training = optimizer is not None
 
     if is_training:
-        model.train()
+        _set_train_mode(model)
     else:
         model.eval()
 
@@ -119,10 +141,20 @@ def train_model(
     scheduler: Optional[optim.lr_scheduler.LRScheduler] = None,
     history: Optional[dict[str, list[float]]] = None,
     early_stopping_patience: Optional[int] = None,
+    reset_early_stopping: bool = False,
     device: torch.device = torch.device("cpu"),
     use_channels_last: bool = False,
 ) -> dict[str, list[float]]:
-    """Train a model, save checkpoints/history, and return the history."""
+    """Train a model, save checkpoints/history, and return the history.
+
+    When ``reset_early_stopping`` is true, the patience counter starts from
+    zero for this call and is measured against the best validation F1 of
+    this call, while the global best F1 is still used for checkpoint
+    selection. This is used when the training regime changes (a new
+    augmentation level or a newly unfrozen group): the patience counter
+    must not leak across stages, otherwise a stage can start with an already
+    exhausted counter and run one unintended extra epoch.
+    """
     if use_channels_last:
         model = model.to(
             device=device,
@@ -151,21 +183,36 @@ def train_model(
         history["val_macro_f1"],
         default=-float("inf"),
     )
-    epochs_without_improvement = 0
 
-    # Count epochs_without_improvement so early stopping also accounts for
-    # epochs completed
-    for value in reversed(history["val_macro_f1"]):
-        if value >= best_val_f1:
-            break
-        epochs_without_improvement += 1
+    # Checkpoint selection always uses the global best F1. The patience
+    # counter either continues from the previous epochs or starts a new
+    # phase and is measured against the best F1 within this call
+    if reset_early_stopping:
+        patience_best_f1 = -float("inf")
+        epochs_without_improvement = 0
+    else:
+        patience_best_f1 = best_val_f1
+        epochs_without_improvement = 0
+        for value in reversed(history["val_macro_f1"]):
+            if value >= best_val_f1:
+                break
+            epochs_without_improvement += 1
 
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    # _best.pt keeps weights only for evaluation; _last.pt also keeps training
-    # state so a run can be resumed
+    # _best.pt keeps weights only for evaluation
+    # _last.pt additionally keeps optimizer/scheduler state and the names of
+    # trainable parameters
     best_path = checkpoint_dir / f"{experiment_name}_best.pt"
     last_path = checkpoint_dir / f"{experiment_name}_last.pt"
     history_path = checkpoint_dir / f"{experiment_name}_history.json"
+
+    # Record trainable parameters so the unfreezing state is preserved in
+    # the checkpoint
+    trainable_parameter_names = [
+        name
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    ]
 
     for local_epoch in range(1, epochs + 1):
         epoch = start_epoch + local_epoch - 1
@@ -258,13 +305,13 @@ def train_model(
                 scheduler.state_dict() if scheduler is not None else None
             ),
             "val_metrics": val_metrics_to_save,
+            "trainable_parameter_names": trainable_parameter_names,
         }
         torch.save(last_checkpoint, last_path)
 
         # The best checkpoint stores weights only and is used for evaluation
         if val_metrics["macro_f1"] > best_val_f1:
             best_val_f1 = val_metrics["macro_f1"]
-            epochs_without_improvement = 0
 
             best_checkpoint = {
                 "epoch": epoch,
@@ -273,6 +320,12 @@ def train_model(
             }
             torch.save(best_checkpoint, best_path)
             print(f"Best model updated. " f"Val Macro F1: {best_val_f1:.4f}")
+
+        # Patience is tracked separately so that it can restart at every
+        # new training regime without affecting checkpoint selection
+        if val_metrics["macro_f1"] > patience_best_f1:
+            patience_best_f1 = val_metrics["macro_f1"]
+            epochs_without_improvement = 0
         else:
             epochs_without_improvement += 1
 
@@ -284,6 +337,7 @@ def train_model(
         if (
             early_stopping_patience is not None
             and epochs_without_improvement >= early_stopping_patience
+            and local_epoch < epochs
         ):
             print("\nEarly stopping")
             break
