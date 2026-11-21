@@ -218,6 +218,44 @@ class CaltechDataset(Dataset):
         return image, label
 
 
+class PseudoLabelDataset(Dataset):
+    """Selected images with model-generated labels.
+    Only teacher predictions are used as targets.
+    """
+
+    def __init__(
+        self,
+        base_dataset: CaltechDataset,
+        sample_indices: Sequence[int],
+        pseudo_labels: Sequence[int],
+    ) -> None:
+        if len(sample_indices) != len(pseudo_labels):
+            raise ValueError(
+                "sample_indices and pseudo_labels must have equal length"
+            )
+
+        self.base_dataset: CaltechDataset = base_dataset
+        self.sample_indices: np.ndarray = np.asarray(
+            sample_indices,
+            dtype=np.int64,
+        )
+        self.pseudo_labels: np.ndarray = np.asarray(
+            pseudo_labels,
+            dtype=np.int64,
+        )
+
+    def __len__(self) -> int:
+        return len(self.sample_indices)
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, int]:
+        base_index = int(self.sample_indices[index])
+        # The true label returned by the base dataset is intentionally ignored
+        image, _ = self.base_dataset[base_index]
+        label = int(self.pseudo_labels[index])
+
+        return image, label
+
+
 def build_datasets(
     images_path: Path,
     labels_path: Path,

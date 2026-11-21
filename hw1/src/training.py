@@ -184,9 +184,9 @@ def train_model(
         default=-float("inf"),
     )
 
-    # Checkpoint selection always uses the global best F1. The patience
-    # counter either continues from the previous epochs or starts a new
-    # phase and is measured against the best F1 within this call
+    # Checkpoint selection uses the global best F1
+    # The patience counter either continues from the previous epochs
+    # or starts a new phase
     if reset_early_stopping:
         patience_best_f1 = -float("inf")
         epochs_without_improvement = 0
@@ -415,4 +415,47 @@ def evaluate_model(
         optimizer=None,
         device=device,
         use_channels_last=use_channels_last,
+    )
+
+
+def predict_probabilities(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device = torch.device("cpu"),
+    use_channels_last: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return predicted classes and softmax confidences in loader order.
+
+    Only images are used; labels returned by the loader are ignored.
+    """
+    if use_channels_last:
+        model = model.to(
+            device=device,
+            memory_format=torch.channels_last,
+        )
+    else:
+        model = model.to(device)
+
+    model.eval()
+    all_predictions: list[np.ndarray] = []
+    all_confidences: list[np.ndarray] = []
+
+    with torch.no_grad():
+        for images_batch, _ in loader:
+            if use_channels_last:
+                images_batch = images_batch.to(
+                    device=device,
+                    memory_format=torch.channels_last,
+                )
+            else:
+                images_batch = images_batch.to(device)
+
+            probabilities = torch.softmax(model(images_batch), dim=1)
+            confidences, predictions = probabilities.max(dim=1)
+            all_predictions.append(predictions.cpu().numpy())
+            all_confidences.append(confidences.cpu().numpy())
+
+    return (
+        np.concatenate(all_predictions),
+        np.concatenate(all_confidences),
     )

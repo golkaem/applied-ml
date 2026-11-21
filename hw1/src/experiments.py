@@ -4,16 +4,22 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
+import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import ConcatDataset, DataLoader, Dataset
 
-from src.data import build_loaders, build_train_transform, clone_with_transform
+from src.data import (
+    PseudoLabelDataset,
+    build_loaders,
+    build_train_transform,
+    clone_with_transform,
+)
 from src.models import (
     assert_groups_cover_model,
     build_model,
@@ -25,6 +31,7 @@ from src.models import (
 from src.training import (
     evaluate_model,
     load_best_model,
+    predict_probabilities,
     train_model,
 )
 from src.utils import set_seed
@@ -557,3 +564,114 @@ def run_unfreeze_experiment(
         train_minutes=train_minutes,
         title=f"{title_prefix}: {model_name}",
     )
+
+
+def run_pseudo_label_experiment(
+    model_name: str,
+    settings: ModelSettings,
+    config: BaselineConfig,
+    confidence_threshold: float = 0.9,
+    experiment_prefix: str = "pseudo_local",
+    title_prefix: str = "Pseudo-labeling",
+) -> ExperimentResult:
+    """Train on labeled data and confident pseudo-labels from test images.
+
+    The teacher is the already trained baseline of the same
+    model. Pseudo-labels are from teacher predictions.
+    """
+    if not 0.0 < confidence_threshold < 1.0:
+        raise ValueError("confidence_threshold must be in (0, 1)")
+
+    set_seed(config.seed)
+
+    _, _, test_loader = build_loaders(
+        train_dataset=config.train_dataset,
+        val_dataset=config.val_dataset,
+        test_dataset=config.test_dataset,
+        batch_size=settings.batch_size,
+        num_workers=config.num_workers,
+        seed=config.seed,
+    )
+
+    teacher_path = (
+        config.checkpoint_dir
+        / f"{config.baseline_prefix}_{model_name}_best.pt"
+    )
+    if not teacher_path.exists():
+        raise FileNotFoundError(
+            f"Teacher checkpoint not found: {teacher_path}"
+        )
+
+    teacher, _ = build_model(model_name, config.num_classes)
+    teacher = load_best_model(
+        model=teacher,
+        checkpoint_path=teacher_path,
+        device=config.device,
+        use_channels_last=settings.channels_last,
+    )
+
+    selection_started = time.perf_counter()
+
+    # The teacher predicts test labels; true labels are not used
+    predictions, confidences = predict_probabilities(
+        model=teacher,
+        loader=test_loader,
+        device=config.device,
+        use_channels_last=settings.channels_last,
+    )
+    selected = confidences >= confidence_threshold
+    pseudo_indices = np.flatnonzero(selected)
+    pseudo_labels = predictions[selected]
+
+    if len(pseudo_indices) == 0:
+        raise ValueError(
+            "No test images reached confidence "
+            f"{confidence_threshold:.2f}; lower the threshold"
+        )
+
+    print(
+        f"\nPseudo-labeling: {len(pseudo_indices)} of "
+        f"{len(predictions)} test images "
+        f"({len(pseudo_indices) / len(predictions):.1%}) "
+        f"passed threshold {confidence_threshold:.2f}"
+    )
+
+    # Augmentation as in the baseline
+    image_size = config.train_dataset.images.shape[1]
+    pseudo_base = clone_with_transform(
+        config.test_dataset,
+        build_train_transform(0, image_size=image_size),
+    )
+    pseudo_dataset = PseudoLabelDataset(
+        base_dataset=pseudo_base,
+        sample_indices=pseudo_indices,
+        pseudo_labels=pseudo_labels,
+    )
+    combined_train = ConcatDataset([config.train_dataset, pseudo_dataset])
+    selection_minutes = (time.perf_counter() - selection_started) / 60.0
+
+    # Reuse the baseline training loop on the combined dataset
+    pseudo_config = replace(config, train_dataset=combined_train)
+    result = run_baseline_experiment(
+        model_name=model_name,
+        settings=settings,
+        config=pseudo_config,
+        experiment_prefix=experiment_prefix,
+        title_prefix=title_prefix,
+    )
+    result.train_minutes += selection_minutes
+
+    experiment_name = f"{experiment_prefix}_{model_name}"
+    stats_path = config.checkpoint_dir / f"{experiment_name}_pseudo.json"
+    pseudo_stats = {
+        "teacher_checkpoint": teacher_path.name,
+        "confidence_threshold": confidence_threshold,
+        "test_images": int(len(predictions)),
+        "pseudo_labeled_images": int(len(pseudo_indices)),
+        "coverage": float(len(pseudo_indices) / len(predictions)),
+        "unique_pseudo_classes": int(np.unique(pseudo_labels).size),
+    }
+    with stats_path.open("w", encoding="utf-8") as file:
+        json.dump(pseudo_stats, file, indent=4)
+
+    return result
